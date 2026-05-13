@@ -23,9 +23,8 @@ from src.features    import engineer, MultiSiteScaler
 from src.dataset_gnn import GraphSolarDataset, GNN_FEAT_COLS
 from src.graph       import build_graph
 from src.model_gnn   import SolarGNN
-from src.train       import masked_mse_loss
-from src.metrics     import evaluate_all, print_results
-from src.utils       import detect_steps_per_hour, hours_to_steps, persistence_baseline
+from src.train       import train_gnn, predict_gnn
+from src.metrics     import evaluate_all, persistence_baseline, print_results
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DATA_DIR   = Path(__file__).parent / "dataset"
@@ -135,69 +134,16 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] SolarGNN (N={N} stations) — {n_params:,} trainable parameters")
 
-    # ── 7. Train ───────────────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5,
+    # ── 8. Train ─────────────────────────────────────────────────────────────
+    print(f"\n[train] device={args.device} | epochs={args.epochs} | lr={args.lr}")
+    history = train_gnn(
+        model, train_loader, val_loader, adj_norm,
+        epochs=args.epochs, lr=args.lr,
+        patience=args.patience, device=args.device,
     )
 
-    best_val, best_state, no_improve = float("inf"), None, 0
-    history_train, history_val = [], []
-    print(f"\n[train] device={args.device} | epochs={args.epochs} | lr={args.lr}")
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_losses = []
-        for x, y, is_day in train_loader:
-            x, y, is_day = x.to(args.device), y.to(args.device), is_day.to(args.device)
-            optimizer.zero_grad()
-            pred = model(x, adj_norm)
-            loss = masked_mse_loss(pred, y, is_day)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for x, y, is_day in val_loader:
-                x, y, is_day = x.to(args.device), y.to(args.device), is_day.to(args.device)
-                val_losses.append(masked_mse_loss(model(x, adj_norm), y, is_day).item())
-
-        tl, vl = float(np.mean(train_losses)), float(np.mean(val_losses))
-        history_train.append(tl)
-        history_val.append(vl)
-        scheduler.step(vl)
-
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:>4} | train {tl:.5f} | val {vl:.5f}")
-
-        if vl < best_val - 1e-5:
-            best_val, best_state, no_improve = vl, {k: v.cpu().clone() for k, v in model.state_dict().items()}, 0
-        else:
-            no_improve += 1
-            if no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch} (best val {best_val:.5f})")
-                break
-
-    if best_state:
-        model.load_state_dict(best_state)
-
-    # ── 8. Evaluate ────────────────────────────────────────────────────────
-    model.eval()
-    all_true, all_pred, all_day = [], [], []
-    with torch.no_grad():
-        for x, y, is_day in test_loader:
-            x = x.to(args.device)
-            pred = model(x, adj_norm)
-            all_true.append(y.numpy())
-            all_pred.append(pred.cpu().numpy())
-            all_day.append(is_day.numpy())
-
-    y_true = np.concatenate(all_true, axis=0)
-    y_pred = np.concatenate(all_pred, axis=0)
-    is_day = np.concatenate(all_day,  axis=0)
+    # ── 9. Evaluate ──────────────────────────────────────────────────────────
+    y_true, y_pred, is_day_arr = predict_gnn(model, test_loader, adj_norm, device=args.device)
 
     test_raw_indices = [full_ds.indices[i] for i in ds_indices(val_end, T)]
     persistence = persistence_baseline(kt_raw, horizons_steps)
@@ -222,14 +168,13 @@ def main(args):
     res_path = Path(__file__).parent / "results_gnn.npz"
     np.savez(
         res_path,
-        y_true         = y_true,
-        y_pred         = y_pred,
-        y_pers         = y_pers,
-        is_day         = is_day,
-        train_loss     = np.array(history_train),
-        val_loss       = np.array(history_val),
-        horizons       = np.array(args.horizons),
-        horizons_steps = np.array(horizons_steps),
+        y_true     = y_true,
+        y_pred     = y_pred,
+        y_pers     = y_pers,
+        is_day     = is_day_arr,
+        train_loss = np.array(history["train_loss"]),
+        val_loss   = np.array(history["val_loss"]),
+        horizons   = np.array(HORIZONS),
     )
     print(f"[saved] {res_path}")
 

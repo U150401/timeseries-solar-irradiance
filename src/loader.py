@@ -3,9 +3,6 @@ import pandas as pd
 from pathlib import Path
 
 
-NEIGHBOR_COLS = ["kt", "Cloud Type", "Relative Humidity", "Wind Speed", "sin_wind", "cos_wind"]
-
-
 def load_nsrdb(path: str | Path) -> pd.DataFrame:
     """
     Load one NSRDB CSV. Skips the 2 metadata rows, parses datetime from

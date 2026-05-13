@@ -24,17 +24,16 @@ from src.features import (
 from src.dataset  import SolarDataset, time_split
 from src.model    import SolarGRU
 from src.train    import train, predict
-from src.metrics  import evaluate_all, print_results
-from src.utils    import detect_steps_per_hour, hours_to_steps, persistence_baseline
+from src.metrics  import evaluate_all, persistence_baseline, print_results
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-DATA_DIR   = Path(__file__).parent / "dataset"
-TARGET_ID  = "41.93"           # substring identifying the target CSV
-HORIZONS_H = [1, 6, 24]        # forecast horizons in **hours**
-LOOKBACK_H = 24                # lookback window in **hours**
-BATCH_SIZE = 128
-EPOCHS     = 50
-PATIENCE   = 8
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_DIR   = Path(__file__).parent / "data"
+TARGET_ID  = "41.93"          # substring that identifies the target CSV
+HORIZONS   = [1, 6, 24]       # forecast horizons in hours
+LOOKBACK   = 24               # lookback window in hours
+BATCH_SIZE = 64
+EPOCHS     = 100
+PATIENCE   = 15
 LR         = 1e-3
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 SEED       = 42
@@ -83,17 +82,18 @@ def main(args):
         target_arr, neighbor_arrs, kt_raw, clearsky_raw,
         lookback=lookback_steps, horizons=horizons_steps,
     )
-    valid_start = lookback_steps
-    max_h       = max(horizons_steps)
+    # Map raw time indices to dataset indices (dataset starts at lookback)
+    valid_start = args.lookback
+    max_h       = max(HORIZONS)
 
-    def ds_indices(raw_idx):
-        lo = max(raw_idx[0],  valid_start)
-        hi = min(raw_idx[-1], T - max_h - 1)
+    def ds_indices(lo: int, hi: int) -> list[int]:
+        lo = max(lo, valid_start)
+        hi = min(hi, T - max_h - 1)
         return list(range(max(0, lo - valid_start), min(len(full_ds), hi - valid_start + 1)))
 
-    train_ds = Subset(full_ds, ds_indices(train_idx))
-    val_ds   = Subset(full_ds, ds_indices(val_idx))
-    test_ds  = Subset(full_ds, ds_indices(test_idx))
+    train_ds = Subset(full_ds, ds_indices(int(train_idx[0]),  int(train_idx[-1])))
+    val_ds   = Subset(full_ds, ds_indices(int(val_idx[0]),    int(val_idx[-1])))
+    test_ds  = Subset(full_ds, ds_indices(int(test_idx[0]),   int(test_idx[-1])))
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -128,9 +128,9 @@ def main(args):
     # ── 8. Evaluate ──────────────────────────────────────────────────────────
     y_true, y_pred, is_day = predict(model, test_loader, device=args.device)
 
-    ds_test_raw = [full_ds.indices[i] for i in ds_indices(test_idx)]
-    persistence = persistence_baseline(kt_raw, horizons_steps)
-    y_pers = persistence[ds_test_raw]
+    # Persistence baseline — raw time index for each test window
+    test_raw_idxs = [int(full_ds.indices[i]) for i in ds_indices(int(test_idx[0]), int(test_idx[-1]))]
+    y_pers = persistence_baseline(kt_raw, HORIZONS)[test_raw_idxs]
 
     horizon_labels = [f"{h}h" for h in args.horizons]
     results = evaluate_all(y_true, y_pred, y_pers, horizon_labels, is_day.astype(bool))
