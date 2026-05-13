@@ -132,94 +132,100 @@ Metrics on the held-out test set (last 15%):
 
 ```
 Project/
-├── data/
-│   ├── 231955_41.93_-4.26_tdy-2022.csv    ← target station (Spain, Valladolid)
-│   └── 231954_45_-40.26_tdy-2022.csv      ← neighbour placeholder (Atlantic)
+├── dataset/                          ← NSRDB CSVs (one per station × year)
+│   └── <hash>/<stationID>_<lat>_<lon>_<year>.csv
 │
 ├── src/
-│   ├── loader.py       — NSRDB CSV loading; auto-discovers target vs neighbours
+│   ├── loader.py       — NSRDB CSV loading, auto-discovers target & neighbours
 │   ├── features.py     — clearsky index, cyclical encodings, MultiSiteScaler
-│   ├── dataset.py      — SolarDataset for GRU (sliding window, time_split)
+│   ├── dataset.py      — SolarDataset for GRU (sliding window)
 │   ├── dataset_gnn.py  — GraphSolarDataset: returns (L, N, F) tensors
 │   ├── graph.py        — Haversine distance, Gaussian adjacency, GCN normalisation
 │   ├── model.py        — SolarGRU architecture
 │   ├── model_gnn.py    — SolarGNN: GCN layers + GRU + prediction head
 │   ├── train.py        — training loop, daytime-weighted MSE, early stopping
-│   └── metrics.py      — MAE, RMSE, nRMSE, Skill Score, R²
+│   ├── metrics.py      — MAE, RMSE, nRMSE, Skill Score, R²
+│   └── utils.py        — steps_per_hour, hours→steps, persistence helper
+│
+├── main_sarima.py  — SARIMA per-horizon direct-forecast entry point
+├── main.py         — SolarGRU entry point
+├── main_gnn.py     — SolarGNN entry point
+├── compare_models.py — Compares results_*.npz, writes figures/ + CSV
 │
 ├── notebooks/
 │   ├── eda_cross_correlation.ipynb   — CCF, ACF, STL decomposition, seasonality
-│   └── model_comparison.ipynb        — train both models, compare metrics & plots
+│   └── model_comparison.ipynb        — loads results_*.npz, no training
 │
-├── main.py         — GRU pipeline entry point
-├── main_gnn.py     — GNN pipeline entry point
-├── solar_gru.pt    — saved GRU checkpoint
-└── solar_gnn_graph.pt  — saved GNN checkpoint (includes adjacency + coordinates)
+├── results_sarima.npz                ← saved predictions per model
+├── results_gru.npz
+├── results_gnn.npz
+├── solar_gru.pt                      ← model checkpoints
+└── solar_gnn_graph.pt
 ```
+
+### SARIMA methodology (per-horizon direct forecast)
+
+For every horizon h ∈ {1 h, 6 h, 24 h} a **separate** SARIMA(1,0,1)(1,1,1)[s=24]
+is fit on the hourly-aggregated target series, with a fit window that scales
+with the horizon (30, 60, 120 days respectively). At each daily anchor in the
+test set the fitted parameters are applied to a 14-day window of recent kt
+and `forecast(steps=h+24)` produces the direct h-step ahead prediction —
+short-horizon error never compounds into long-horizon estimates.
 
 ---
 
 ## Requirements
 
-```
-torch >= 2.0
-pandas
-numpy
-scikit-learn
-statsmodels
-matplotlib
-jupyter
-```
-
-Install with:
+Managed via `pyproject.toml` and [uv](https://github.com/astral-sh/uv):
 
 ```bash
-pip install torch pandas numpy scikit-learn statsmodels matplotlib jupyter
+uv sync           # installs torch, pandas, numpy, scikit-learn, statsmodels, matplotlib, jupyter
 ```
 
 ---
 
 ## How to run
 
-### Train SolarGRU
+### Train all three models
 
 ```bash
-python main.py
-python main.py --epochs 200 --lookback 48 --lr 5e-4 --device cuda
+uv run python main_sarima.py                       # one direct-forecast SARIMA per horizon
+uv run python main.py --epochs 30 --device cuda    # SolarGRU
+uv run python main_gnn.py --epochs 30 --device cuda  # SolarGNN
+uv run python compare_models.py                    # produce figures/ + comparison_metrics.csv
 ```
 
-| Argument | Default | Description |
+Each entry point accepts `--horizons 1 6 24` (hours), `--data_dir`, `--target_id`. All
+horizons are specified in **hours** and converted to native step counts using the data's
+sampling interval (15-minute → 4 steps/hour for GRU/GNN, hourly for SARIMA).
+
+| Common argument | Default | Description |
 |---|---|---|
-| `--epochs` | 100 | Maximum training epochs |
-| `--lookback` | 24 | History window (hours) |
-| `--batch_size` | 64 | Mini-batch size |
+| `--horizons` | `1 6 24` | Forecast horizons in hours |
+| `--data_dir` | `dataset` | Folder scanned recursively for NSRDB CSVs |
+| `--target_id` | `41.93` | Substring identifying the target station's CSV |
+| `--epochs` | 50 (GRU/GNN) | Maximum training epochs |
+| `--lookback` | 24 | History window in hours (GRU/GNN) |
+| `--batch_size` | 128 | Mini-batch size (GRU/GNN) |
 | `--lr` | 1e-3 | Initial learning rate |
-| `--patience` | 15 | Early stopping patience |
-| `--device` | auto | `cpu` or `cuda` |
+| `--patience` | 8 | Early stopping patience |
+| `--device` | auto | `cpu` or `cuda` (GRU/GNN) |
+| `--sigma_km` | 100 | Gaussian kernel bandwidth in km (GNN only) |
+| `--fit_days` | per-horizon | SARIMA fit window (1h: 30 d, 6h: 60 d, 24h: 120 d) |
+| `--warmup_days` | 14 | Days of recent observations passed to SARIMA's `apply()` per anchor |
 
-### Train SolarGNN
+A good rule of thumb for `sigma_km`: set it to the typical distance between your stations.
+The current Catalonia stations are 30-100 km apart, so 100 is appropriate.
 
-```bash
-python main_gnn.py
-python main_gnn.py --sigma_km 1000 --epochs 200 --device cuda
-```
-
-| Argument | Default | Description |
-|---|---|---|
-| `--sigma_km` | 500 | Gaussian kernel bandwidth in km — controls how fast edge weights decay with distance |
-| *(same as above)* | | |
-
-A good rule of thumb for `sigma_km`: set it to the typical distance between your stations. With Spanish stations ~300–500 km apart, 500 is appropriate. With only the Atlantic placeholder (~3700 km), the edge weight is effectively 0 — the GNN will still train but ignores the neighbour.
-
-### Compare both models visually
-
-Open the notebook:
+### Compare models
 
 ```bash
-jupyter notebook notebooks/model_comparison.ipynb
+uv run python compare_models.py
 ```
 
-This trains both models, plots training curves, metrics tables, time series, scatter plots, error distributions, and a clear-day vs cloudy-day case study.
+Reads `results_sarima.npz`, `results_gru.npz`, `results_gnn.npz` and writes
+`figures/*.png` plus `comparison_metrics.csv`. Open `notebooks/model_comparison.ipynb`
+for the same analysis in interactive form.
 
 ### Explore cross-correlations and seasonality
 
@@ -229,12 +235,12 @@ jupyter notebook notebooks/eda_cross_correlation.ipynb
 
 ### Adding more stations
 
-1. Download NSRDB CSVs for additional Spanish locations from [developer.nrel.gov](https://developer.nrel.gov/docs/solar/nsrdb/).
-2. Drop the CSV files into `data/`.
-3. Re-run `main.py` or `main_gnn.py` — both auto-detect all CSVs.
-4. For the GNN, closer stations (western Spain, Portugal) will automatically receive higher edge weights via the Gaussian kernel.
+1. Download NSRDB CSVs for additional locations from [developer.nrel.gov](https://developer.nrel.gov/docs/solar/nsrdb/).
+2. Drop the CSV files (or subfolders containing them) anywhere under `dataset/`.
+3. Re-run `main.py` or `main_gnn.py` — both auto-detect all CSVs and group by station (multi-year files are concatenated automatically).
+4. For the GNN, closer stations will automatically receive higher edge weights via the Gaussian kernel.
 
-To change the target station, update `TARGET_ID` in `main.py` / `main_gnn.py` to a substring of the target CSV filename.
+To change the target station, pass `--target_id <substring-of-filename>` on the command line.
 
 ---
 
