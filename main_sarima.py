@@ -1,34 +1,38 @@
 """
-SARIMA baseline for solar kt forecasting.
+SARIMA baseline for solar kt forecasting — one direct-forecast model per horizon.
 
-The seasonal period s is auto-detected from the data time index so that it
-always equals one full day regardless of the recording interval:
-  • 60-min data  → s = 24
-  • 15-min data  → s = 96   (default for NSRDB)
+Methodology
+-----------
+The native data is 15-minute resolution.  Fitting a SARIMA with a 96-step
+seasonal period on a multi-year series is intractable (the Kalman filter state
+grows quadratically with the seasonal period).  We therefore aggregate the
+clearsky-index series to **hourly means** for SARIMA only — this gives the
+classical s=24 daily seasonality that SARIMA was designed for.
 
-Fits SARIMA(1,0,1)(1,1,1)[s] on the training split and evaluates on
-the same test split used by the neural network models, making metrics
-directly comparable.
+For every forecast horizon (in hours) we fit a *separate* SARIMA(p,d,q)(P,D,Q)[s]
+on the target station's hourly kt series and produce the h-step ahead direct
+forecast at each test anchor by applying the fitted parameters to a recent
+window and calling `forecast(steps=h)`.  Fitting one model per horizon avoids
+recursive 1-step error accumulation for the 6h and 24h horizons.
 
-Forecast methodology
---------------------
-• +1 step  : true one-step-ahead Kalman-filter prediction at every test
-             point (uses actual observations up to t, predicts t+1).
-• +6/+24 steps : dynamic (recursive) forecast anchored every s steps
-             (one full day). Within each day window the model forecasts
-             recursively; at the next day boundary it is re-anchored to
-             real data, keeping the recursive chain short.
+The horizons are commensurate with the GRU/GNN setup (1h, 6h, 24h ahead in
+wall-clock time).  Metrics are computed at the hourly resolution and labelled
+identically so the three models can be compared.
 
 Usage
 -----
     python main_sarima.py
-    python main_sarima.py --fit_len 35040  # fit on last year only (15-min)
+    python main_sarima.py --horizons 1 6 24 --fit_days 90
 """
+from __future__ import annotations
+
 import argparse
 import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+
 warnings.filterwarnings("ignore")
 
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -36,16 +40,11 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from src.loader   import load_all
 from src.features import engineer
 from src.metrics  import evaluate_all, print_results
+from src.utils    import persistence_baseline
 
 ROOT      = Path(__file__).parent
-DATA_DIR  = ROOT / "data"
+DATA_DIR  = ROOT / "dataset"
 TARGET_ID = "41.93"
-HORIZONS  = [1, 6, 24]
-ORDER     = (1, 0, 1)
-# SEASONAL_ORDER is built dynamically in main() once the interval is known.
-# FIT_LEN default: 1 year of data (auto-set after interval detection)
-FIT_LEN   = None   # None → auto (1 year of training data)
-
 
 def main(args: argparse.Namespace) -> None:
 
@@ -172,17 +171,111 @@ def main(args: argparse.Namespace) -> None:
 
         y_pred[:, h_idx] = h_preds
 
+
+def fit_sarima_for_horizon(kt, train_end, fit_len, order, seasonal_order):
+    """Fit one SARIMA on the last `fit_len` hourly observations before train_end."""
+    series = kt[max(0, train_end - fit_len) : train_end]
+    return _build_sarimax(series, order, seasonal_order).fit(disp=False, maxiter=200)
+
+
+def predict_direct_h(
+    fit_result,
+    kt: np.ndarray,
+    val_end: int,
+    n_test: int,
+    h: int,
+    batch_steps: int,
+    warmup: int,
+) -> np.ndarray:
+    """Direct h-step ahead forecast at every test point (hourly granularity).
+
+    For each daily anchor we slice a recent window of observed kt, apply the
+    fitted parameters to that window, then call `forecast(steps=batch + h)`.
+    The element at offset `h-1+j` from the anchor is the direct h-step ahead
+    forecast for test point i = b_start + j.
+    """
+    preds = np.full(n_test, np.nan, dtype=np.float64)
+    warmup = max(warmup, 96)   # at least 4 daily cycles
+    for b_start in range(0, n_test, batch_steps):
+        b_end = min(b_start + batch_steps, n_test)
+        anchor = val_end + b_start
+        lo = max(0, anchor + 1 - warmup)
+        window = kt[lo : anchor + 1]
+        applied = fit_result.apply(endog=window, refit=False)
+        n_steps_needed = (b_end - b_start) + h
+        fc = np.asarray(applied.forecast(steps=n_steps_needed))
+        for j in range(b_end - b_start):
+            idx = j + h - 1
+            if idx < len(fc):
+                preds[b_start + j] = fc[idx]
+    return preds
+
+
+def main(args: argparse.Namespace) -> None:
+    # ── 1. Load 15-min target series, then aggregate to hourly ──────────────
+    target_raw, _ = load_all(args.data_dir, args.target_id)
+    target_df     = engineer(target_raw)
+
+    hourly = target_df[["kt", "Clearsky GHI"]].resample("h").mean()
+    kt        = hourly["kt"].values.astype(np.float64)
+    clearsky  = hourly["Clearsky GHI"].values
+
+    s = 24
+    seasonal_order = (*DEFAULT_SEASONAL_ORDER, s)
+
+    horizons_h = args.horizons      # already in hours; at hourly resolution h_steps == h_hours
+    print(f"[sarima] Hourly series, T={len(kt)}  s={s}  horizons(h)={horizons_h}")
+
+    # ── 2. Splits (chronological) ──────────────────────────────────────────
+    T          = len(kt)
+    train_end  = int(T * 0.70)
+    val_end    = int(T * 0.85)
+    max_h      = max(horizons_h)
+    n_test     = T - val_end - max_h
+    print(f"[sarima] train_end={train_end}  val_end={val_end}  n_test={n_test}")
+
+    # ── 3. Fit one SARIMA per horizon ──────────────────────────────────────
+    fitted: dict[int, object] = {}
+    fit_lens: dict[int, int] = {}
+
+    for h in horizons_h:
+        fit_days = args.fit_days if args.fit_days is not None else HORIZON_FIT_DAYS.get(h, 60)
+        fit_len  = min(fit_days * 24, train_end)
+        fit_lens[h] = fit_len
+        print(
+            f"\n[sarima] Fitting horizon={h}h  "
+            f"order={DEFAULT_ORDER}  seasonal_order={seasonal_order}  "
+            f"fit_days={fit_days}  fit_len={fit_len}"
+        )
+        result = fit_sarima_for_horizon(
+            kt, train_end, fit_len, DEFAULT_ORDER, seasonal_order
+        )
+        fitted[h] = result
+        print(f"[sarima] AIC={result.aic:.2f}  BIC={result.bic:.2f}  "
+              f"params={dict(zip(result.param_names, np.round(result.params, 4)))}")
+
+    # ── 4. Direct h-step predictions for each horizon ──────────────────────
+    y_pred = np.zeros((n_test, len(horizons_h)), dtype=np.float64)
+    for h_idx, h in enumerate(horizons_h):
+        print(f"\n[sarima] Forecasting horizon={h}h …", flush=True)
+        y_pred[:, h_idx] = predict_direct_h(
+            fit_result = fitted[h],
+            kt         = kt,
+            val_end    = val_end,
+            n_test     = n_test,
+            h          = h,
+            batch_steps= 24,                                  # re-anchor every day
+            warmup     = args.warmup_days * 24,
+        )
     y_pred = np.clip(y_pred, 0.0, 1.5).astype(np.float32)
 
-    # ── 6. Targets, is_day, persistence ─────────────────────────────────────
-    y_true = np.array(
-        [[kt[val_end + i + h] for h in HORIZONS] for i in range(n_test)],
-        dtype=np.float32,
-    )
-    is_day = np.array(
-        [[float(clearsky[val_end + i + h] > 1.0) for h in HORIZONS]
-         for i in range(n_test)],
-        dtype=np.float32,
+    # ── 5. Targets, daytime mask, persistence ─────────────────────────────
+    y_true = np.stack(
+        [kt[val_end + h : val_end + h + n_test] for h in horizons_h], axis=-1,
+    ).astype(np.float32)
+    is_day = np.stack(
+        [(clearsky[val_end + h : val_end + h + n_test] > 1.0).astype(np.float32)
+         for h in horizons_h], axis=-1,
     )
     # Persistence: predict kt[t+h] = kt[t] for all h.
     # Use kt[val_end + i] (last known value at test point i) for all horizons.
@@ -190,13 +283,13 @@ def main(args: argparse.Namespace) -> None:
         kt[val_end : val_end + n_test, np.newaxis], (1, len(HORIZONS))
     ).astype(np.float32)
 
-    # ── 7. Evaluate ──────────────────────────────────────────────────────────
-    horizon_labels = [f"{h}h" for h in HORIZONS]
+    # ── 6. Evaluate ─────────────────────────────────────────────────────────
+    horizon_labels = [f"{h}h" for h in horizons_h]
     results = evaluate_all(y_true, y_pred, y_pers, horizon_labels, is_day.astype(bool))
     print("\n── SARIMA Test Results ──────────────────────────────────────────")
     print_results(results)
 
-    # ── 8. Save ──────────────────────────────────────────────────────────────
+    # ── 7. Save ─────────────────────────────────────────────────────────────
     res_path = ROOT / "results_sarima.npz"
     np.savez(
         res_path,
@@ -216,11 +309,12 @@ def main(args: argparse.Namespace) -> None:
         param_conf_upper = _conf_upper,
         order            = np.array(ORDER),
         seasonal_order   = np.array(seasonal_order),
-        fit_len          = np.array([fit_len]),
-        steps_per_day    = np.array([steps_per_day]),
-        interval_minutes = np.array([interval_minutes]),
+        fit_lens         = np.array([fit_lens[h] for h in horizons_h]),
+        aic_per_horizon  = np.array([fitted[h].aic for h in horizons_h]),
+        bic_per_horizon  = np.array([fitted[h].bic for h in horizons_h]),
+        granularity      = np.array(["hourly"]),
     )
-    print(f"[saved] {res_path}")
+    print(f"\n[saved] {res_path}")
 
 
 if __name__ == "__main__":

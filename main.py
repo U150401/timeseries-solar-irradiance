@@ -1,13 +1,13 @@
 """
-Multi-site Solar Irradiance Forecasting — Main entry point.
+Multi-site Solar Irradiance Forecasting — GRU entry point.
 
-Target station : Spain (41.93°N, -4.26°W)
-Neighbor(s)    : Atlantic placeholder (extensible — drop more CSVs in data/)
+Target station : Spain (41.93°N, 2.26°E — Catalonia, station 401390)
+Neighbours     : all other CSVs in `dataset/` are auto-discovered.
 
 Usage
 -----
     python main.py
-    python main.py --epochs 200 --lookback 48 --device cuda
+    python main.py --epochs 100 --lookback 24 --device cuda
 """
 import argparse
 from pathlib import Path
@@ -44,11 +44,18 @@ def main(args):
     np.random.seed(SEED)
 
     # ── 1. Load ──────────────────────────────────────────────────────────────
-    target_raw, neighbor_raws = load_all(DATA_DIR, TARGET_ID)
+    target_raw, neighbor_raws = load_all(args.data_dir, args.target_id)
 
     # ── 2. Feature engineering ───────────────────────────────────────────────
     target_df    = engineer(target_raw)
     neighbor_dfs = [engineer(df) for df in neighbor_raws]
+
+    steps_per_hour = detect_steps_per_hour(target_df)
+    horizons_steps = hours_to_steps(args.horizons, steps_per_hour)
+    lookback_steps = args.lookback * steps_per_hour
+    print(f"[main] steps_per_hour={steps_per_hour}  "
+          f"horizons(h→steps): {dict(zip(args.horizons, horizons_steps))}  "
+          f"lookback={args.lookback}h → {lookback_steps} steps")
 
     T = len(target_df)
     train_idx, val_idx, test_idx = time_split(T)
@@ -56,18 +63,12 @@ def main(args):
 
     # ── 3. Scale ─────────────────────────────────────────────────────────────
     scaler = MultiSiteScaler()
-
-    # Fit on train portion only
-    target_train = target_df.iloc[train_idx]
-    scaler.fit_transform_target(target_train, TARGET_FEAT_COLS)   # fit only
-
-    # Apply to full series
+    scaler.fit_transform_target(target_df.iloc[train_idx], TARGET_FEAT_COLS)
     target_scaled = scaler.transform_target(target_df, TARGET_FEAT_COLS)
 
     neighbor_scaled_list = []
     for i, n_df in enumerate(neighbor_dfs):
-        n_train = n_df.iloc[train_idx]
-        scaler.fit_transform_neighbor(n_train, NEIGHBOR_FEAT_COLS, i)
+        scaler.fit_transform_neighbor(n_df.iloc[train_idx], NEIGHBOR_FEAT_COLS, i)
         neighbor_scaled_list.append(scaler.transform_neighbor(n_df, NEIGHBOR_FEAT_COLS, i))
 
     # ── 4. Arrays ────────────────────────────────────────────────────────────
@@ -79,7 +80,7 @@ def main(args):
     # ── 5. Dataset & loaders ─────────────────────────────────────────────────
     full_ds = SolarDataset(
         target_arr, neighbor_arrs, kt_raw, clearsky_raw,
-        lookback=args.lookback, horizons=HORIZONS,
+        lookback=lookback_steps, horizons=horizons_steps,
     )
     # Map raw time indices to dataset indices (dataset starts at lookback)
     valid_start = args.lookback
@@ -109,11 +110,12 @@ def main(args):
         hidden_size=64,
         neighbor_hidden=32,
         n_layers=2,
-        n_horizons=len(HORIZONS),
+        n_horizons=len(horizons_steps),
         dropout=0.2,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[model] SolarGRU — {n_params:,} trainable parameters")
+    print(f"[model] SolarGRU — {n_params:,} trainable parameters "
+          f"(target + {len(neighbor_arrs)} neighbour stations)")
 
     # ── 7. Train ─────────────────────────────────────────────────────────────
     print(f"\n[train] device={args.device} | epochs={args.epochs} | lr={args.lr}")
@@ -130,10 +132,10 @@ def main(args):
     test_raw_idxs = [int(full_ds.indices[i]) for i in ds_indices(int(test_idx[0]), int(test_idx[-1]))]
     y_pers = persistence_baseline(kt_raw, HORIZONS)[test_raw_idxs]
 
-    horizon_labels = [f"{h}h" for h in HORIZONS]
+    horizon_labels = [f"{h}h" for h in args.horizons]
     results = evaluate_all(y_true, y_pred, y_pers, horizon_labels, is_day.astype(bool))
 
-    print("\n── Test Results ──────────────────────────────────────────────────")
+    print("\n── GRU Test Results ─────────────────────────────────────────────")
     print_results(results)
 
     # ── 9. Save model ────────────────────────────────────────────────────────
@@ -141,28 +143,33 @@ def main(args):
     torch.save({"model_state": model.state_dict(), "args": vars(args)}, out_path)
     print(f"\n[saved] {out_path}")
 
-    # ── 10. Save results for report ───────────────────────────────────────────
     res_path = Path(__file__).parent / "results_gru.npz"
     np.savez(
         res_path,
-        y_true     = y_true,
-        y_pred     = y_pred,
-        y_pers     = y_pers,
-        is_day     = is_day,
-        train_loss = np.array(history["train_loss"]),
-        val_loss   = np.array(history["val_loss"]),
-        horizons   = np.array(HORIZONS),
+        y_true         = y_true,
+        y_pred         = y_pred,
+        y_pers         = y_pers,
+        is_day         = is_day,
+        train_loss     = np.array(history["train_loss"]),
+        val_loss       = np.array(history["val_loss"]),
+        horizons       = np.array(args.horizons),
+        horizons_steps = np.array(horizons_steps),
     )
     print(f"[saved] {res_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs",    type=int,   default=EPOCHS)
-    parser.add_argument("--lookback",  type=int,   default=LOOKBACK)
-    parser.add_argument("--batch_size",type=int,   default=BATCH_SIZE)
-    parser.add_argument("--lr",        type=float, default=LR)
-    parser.add_argument("--patience",  type=int,   default=PATIENCE)
-    parser.add_argument("--device",    type=str,   default=DEVICE)
+    parser.add_argument("--data_dir",   type=str,   default=str(DATA_DIR))
+    parser.add_argument("--target_id",  type=str,   default=TARGET_ID)
+    parser.add_argument("--horizons",   type=int,   nargs="+", default=HORIZONS_H,
+                        help="Forecast horizons in hours.")
+    parser.add_argument("--epochs",     type=int,   default=EPOCHS)
+    parser.add_argument("--lookback",   type=int,   default=LOOKBACK_H,
+                        help="Lookback window in hours.")
+    parser.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
+    parser.add_argument("--lr",         type=float, default=LR)
+    parser.add_argument("--patience",   type=int,   default=PATIENCE)
+    parser.add_argument("--device",     type=str,   default=DEVICE)
     args = parser.parse_args()
     main(args)

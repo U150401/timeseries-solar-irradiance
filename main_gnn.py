@@ -1,13 +1,15 @@
 """
-GNN-based Solar Irradiance Forecasting — Entry point.
+Multi-site Solar Irradiance Forecasting — GNN entry point.
 
-Builds a spatial-temporal graph from all CSVs in data/, trains a
-GCN + GRU model, and evaluates against the persistence baseline.
+All stations under `dataset/` are nodes in a graph; edge weights are computed
+from geographic distance via a Gaussian kernel. A 2-layer GCN encodes spatial
+context per timestep; a GRU encodes the temporal evolution of the target
+station's spatial embedding; a small MLP head predicts kt at each horizon.
 
 Usage
 -----
     python main_gnn.py
-    python main_gnn.py --epochs 200 --sigma_km 1000 --device cuda
+    python main_gnn.py --sigma_km 200 --epochs 100 --device cuda
 """
 import argparse
 from pathlib import Path
@@ -24,16 +26,16 @@ from src.model_gnn   import SolarGNN
 from src.train       import train_gnn, predict_gnn
 from src.metrics     import evaluate_all, persistence_baseline, print_results
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR   = Path(__file__).parent / "data"
+# ── Defaults ──────────────────────────────────────────────────────────────────
+DATA_DIR   = Path(__file__).parent / "dataset"
 TARGET_ID  = "41.93"
-HORIZONS   = [1, 6, 24]
-LOOKBACK   = 24
-BATCH_SIZE = 64
-EPOCHS     = 100
-PATIENCE   = 15
+HORIZONS_H = [1, 6, 24]
+LOOKBACK_H = 24
+BATCH_SIZE = 128
+EPOCHS     = 50
+PATIENCE   = 8
 LR         = 1e-3
-SIGMA_KM   = 500.0    # Gaussian kernel bandwidth: distance at which weight ≈ 0.37
+SIGMA_KM   = 100.0    # Catalan stations are 30-100 km apart; smaller σ → sharper locality
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 SEED       = 42
 
@@ -42,7 +44,7 @@ def main(args):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    # ── 1. Discover CSV paths (one representative per station for graph) ──────
+    # ── 1. Discover CSVs and group by station (target first) ────────────────
     def _station_key(path: Path) -> str:
         parts = path.stem.rsplit("_", 1)
         return parts[0] if len(parts) == 2 else path.stem
@@ -58,36 +60,37 @@ def main(args):
                       for key, paths in sorted(station_groups.items())
                       if key != target_key]
 
-    # ── 2. Build graph ───────────────────────────────────────────────────────
+    # ── 2. Build graph ─────────────────────────────────────────────────────
     coords, adj_norm = build_graph(target_path, neighbor_paths, sigma_km=args.sigma_km)
     adj_norm = adj_norm.to(args.device)
 
-    # ── 3. Load & engineer features ─────────────────────────────────────────
+    # ── 3. Load & engineer ─────────────────────────────────────────────────
     target_raw, neighbor_raws = load_all(args.data_dir, args.target_id)
-    all_raws   = [target_raw] + neighbor_raws          # target is always index 0
-    all_feats  = [engineer(df) for df in all_raws]
+    all_raws  = [target_raw] + neighbor_raws            # target is always index 0
+    all_feats = [engineer(df) for df in all_raws]
+
+    steps_per_hour = detect_steps_per_hour(all_feats[0])
+    horizons_steps = hours_to_steps(args.horizons, steps_per_hour)
+    lookback_steps = args.lookback * steps_per_hour
+    print(f"[gnn] steps_per_hour={steps_per_hour}  "
+          f"horizons(h→steps): {dict(zip(args.horizons, horizons_steps))}  "
+          f"lookback={args.lookback}h → {lookback_steps} steps")
 
     T = len(all_feats[0])
     train_end = int(T * 0.70)
     val_end   = int(T * 0.85)
-
     print(f"[split] train={train_end} | val={val_end - train_end} | test={T - val_end} rows")
 
-    # ── 4. Scale — fit on train split, apply to all ──────────────────────────
-    # Each station gets its own StandardScaler (kt always unscaled)
+    # ── 4. Scale (per-station StandardScaler fit on train split) ───────────
     scaler = MultiSiteScaler()
-
-    # Target station
     scaler.fit_transform_target(all_feats[0].iloc[:train_end], GNN_FEAT_COLS)
     scaled_target = scaler.transform_target(all_feats[0], GNN_FEAT_COLS)
 
-    # Neighbour stations
     scaled_neighbours = []
     for i, df in enumerate(all_feats[1:]):
         scaler.fit_transform_neighbor(df.iloc[:train_end], GNN_FEAT_COLS, i)
         scaled_neighbours.append(scaler.transform_neighbor(df, GNN_FEAT_COLS, i))
 
-    # ── 5. Arrays ────────────────────────────────────────────────────────────
     station_arrs = (
         [scaled_target[GNN_FEAT_COLS].values]
         + [df[GNN_FEAT_COLS].values for df in scaled_neighbours]
@@ -95,13 +98,13 @@ def main(args):
     kt_raw       = all_feats[0]["kt"].values
     clearsky_raw = target_raw["Clearsky GHI"].values
 
-    # ── 6. Dataset & loaders ─────────────────────────────────────────────────
-    full_ds  = GraphSolarDataset(
+    # ── 5. Dataset & loaders ───────────────────────────────────────────────
+    full_ds = GraphSolarDataset(
         station_arrs, kt_raw, clearsky_raw,
-        lookback=args.lookback, horizons=HORIZONS,
+        lookback=lookback_steps, horizons=horizons_steps,
     )
-    valid_start = args.lookback
-    max_h       = max(HORIZONS)
+    valid_start = lookback_steps
+    max_h       = max(horizons_steps)
 
     def ds_indices(lo, hi):
         lo = max(lo, valid_start)
@@ -118,16 +121,16 @@ def main(args):
 
     print(f"[dataset] train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)} windows")
 
-    # ── 7. Model ─────────────────────────────────────────────────────────────
+    # ── 6. Model ───────────────────────────────────────────────────────────
     N = len(station_arrs)
     model = SolarGNN(
         n_features=len(GNN_FEAT_COLS),
         gcn_hidden=32,
         gru_hidden=64,
         gru_layers=2,
-        n_horizons=len(HORIZONS),
+        n_horizons=len(horizons_steps),
         dropout=0.2,
-    )
+    ).to(args.device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] SolarGNN (N={N} stations) — {n_params:,} trainable parameters")
 
@@ -142,20 +145,17 @@ def main(args):
     # ── 9. Evaluate ──────────────────────────────────────────────────────────
     y_true, y_pred, is_day_arr = predict_gnn(model, test_loader, adj_norm, device=args.device)
 
-    # Persistence baseline
-    test_raw_indices = [
-        full_ds.indices[i] for i in ds_indices(val_end, T)
-    ]
-    persistence = persistence_baseline(kt_raw, HORIZONS)
+    test_raw_indices = [full_ds.indices[i] for i in ds_indices(val_end, T)]
+    persistence = persistence_baseline(kt_raw, horizons_steps)
     y_pers = persistence[test_raw_indices]
 
-    horizon_labels = [f"{h}h" for h in HORIZONS]
-    results = evaluate_all(y_true, y_pred, y_pers, horizon_labels, is_day_arr.astype(bool))
+    horizon_labels = [f"{h}h" for h in args.horizons]
+    results = evaluate_all(y_true, y_pred, y_pers, horizon_labels, is_day.astype(bool))
 
-    print("\n── GNN Test Results ──────────────────────────────────────────────")
+    print("\n── GNN Test Results ─────────────────────────────────────────────")
     print_results(results)
 
-    # ── 10. Save ─────────────────────────────────────────────────────────────
+    # ── 9. Save ────────────────────────────────────────────────────────────
     out_path = Path(__file__).parent / "solar_gnn_graph.pt"
     torch.save({
         "model_state": model.state_dict(),
@@ -165,7 +165,6 @@ def main(args):
     }, out_path)
     print(f"\n[saved] {out_path}")
 
-    # ── 11. Save results for report ──────────────────────────────────────────
     res_path = Path(__file__).parent / "results_gnn.npz"
     np.savez(
         res_path,
@@ -184,8 +183,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",   type=str,   default=str(DATA_DIR))
     parser.add_argument("--target_id",  type=str,   default=TARGET_ID)
+    parser.add_argument("--horizons",   type=int,   nargs="+", default=HORIZONS_H,
+                        help="Forecast horizons in hours.")
     parser.add_argument("--epochs",     type=int,   default=EPOCHS)
-    parser.add_argument("--lookback",   type=int,   default=LOOKBACK)
+    parser.add_argument("--lookback",   type=int,   default=LOOKBACK_H,
+                        help="Lookback window in hours.")
     parser.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
     parser.add_argument("--lr",         type=float, default=LR)
     parser.add_argument("--patience",   type=int,   default=PATIENCE)
