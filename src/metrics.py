@@ -76,6 +76,23 @@ def evaluate_all(
     return results
 
 
+def persistence_baseline(kt: np.ndarray, horizons: list[int]) -> np.ndarray:
+    """
+    Lag-h persistence baseline.
+
+    persistence[t, h_idx] = kt[t - horizons[h_idx]]
+
+    Index at raw time t to get the baseline prediction for horizon h:
+    predict kt[t + h] = kt[t] by querying persistence[t + h, h_idx].
+    """
+    N, out = len(kt), []
+    for h in horizons:
+        col = np.zeros(N)
+        col[h:] = kt[:-h]
+        out.append(col)
+    return np.stack(out, axis=-1)
+
+
 def print_results(results: dict) -> None:
     header = f"{'Horizon':<10}" + "".join(f"{k:>12}" for k in ["MAE", "RMSE", "nRMSE", "Skill", "R2"])
     print(header)

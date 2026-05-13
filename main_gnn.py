@@ -21,8 +21,8 @@ from src.features    import engineer, MultiSiteScaler
 from src.dataset_gnn import GraphSolarDataset, GNN_FEAT_COLS
 from src.graph       import build_graph
 from src.model_gnn   import SolarGNN
-from src.train       import train, masked_mse_loss, predict
-from src.metrics     import evaluate_all, print_results
+from src.train       import train_gnn, predict_gnn
+from src.metrics     import evaluate_all, persistence_baseline, print_results
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR   = Path(__file__).parent / "data"
@@ -36,16 +36,6 @@ LR         = 1e-3
 SIGMA_KM   = 500.0    # Gaussian kernel bandwidth: distance at which weight ≈ 0.37
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 SEED       = 42
-
-
-def persistence_baseline(kt: np.ndarray, horizons: list[int]) -> np.ndarray:
-    N = len(kt)
-    out = []
-    for h in horizons:
-        col = np.zeros(N)
-        col[h:] = kt[:-h] if h > 0 else kt
-        out.append(col)
-    return np.stack(out, axis=-1)
 
 
 def main(args):
@@ -141,74 +131,16 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] SolarGNN (N={N} stations) — {n_params:,} trainable parameters")
 
-    # ── 8. Train (wraps adj_norm into the forward pass) ──────────────────────
-    # train() from src/train.py assumes (x_t, x_n, y, is_day) batches.
-    # For the GNN the loader returns (x, y, is_day), so we train inline here.
-    model = model.to(args.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    # ── 8. Train ─────────────────────────────────────────────────────────────
+    print(f"\n[train] device={args.device} | epochs={args.epochs} | lr={args.lr}")
+    history = train_gnn(
+        model, train_loader, val_loader, adj_norm,
+        epochs=args.epochs, lr=args.lr,
+        patience=args.patience, device=args.device,
     )
 
-    best_val, best_state, no_improve = float("inf"), None, 0
-    history_train, history_val = [], []
-    print(f"\n[train] device={args.device} | epochs={args.epochs} | lr={args.lr}")
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_losses = []
-        for x, y, is_day in train_loader:
-            x, y, is_day = x.to(args.device), y.to(args.device), is_day.to(args.device)
-            optimizer.zero_grad()
-            pred = model(x, adj_norm)
-            loss = masked_mse_loss(pred, y, is_day)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for x, y, is_day in val_loader:
-                x, y, is_day = x.to(args.device), y.to(args.device), is_day.to(args.device)
-                val_losses.append(masked_mse_loss(model(x, adj_norm), y, is_day).item())
-
-        tl, vl = np.mean(train_losses), np.mean(val_losses)
-        history_train.append(float(tl))
-        history_val.append(float(vl))
-        scheduler.step(vl)
-
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:>4} | train {tl:.5f} | val {vl:.5f}")
-
-        if vl < best_val - 1e-5:
-            best_val   = vl
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch} (best val {best_val:.5f})")
-                break
-
-    if best_state:
-        model.load_state_dict(best_state)
-
     # ── 9. Evaluate ──────────────────────────────────────────────────────────
-    model.eval()
-    all_true, all_pred, all_day = [], [], []
-    with torch.no_grad():
-        for x, y, is_day in test_loader:
-            x = x.to(args.device)
-            pred = model(x, adj_norm)
-            all_true.append(y.numpy())
-            all_pred.append(pred.cpu().numpy())
-            all_day.append(is_day.numpy())
-
-    y_true = np.concatenate(all_true,  axis=0)
-    y_pred = np.concatenate(all_pred,  axis=0)
-    is_day_arr = np.concatenate(all_day, axis=0)
+    y_true, y_pred, is_day_arr = predict_gnn(model, test_loader, adj_norm, device=args.device)
 
     # Persistence baseline
     test_raw_indices = [
@@ -241,8 +173,8 @@ def main(args):
         y_pred     = y_pred,
         y_pers     = y_pers,
         is_day     = is_day_arr,
-        train_loss = np.array(history_train),
-        val_loss   = np.array(history_val),
+        train_loss = np.array(history["train_loss"]),
+        val_loss   = np.array(history["val_loss"]),
         horizons   = np.array(HORIZONS),
     )
     print(f"[saved] {res_path}")

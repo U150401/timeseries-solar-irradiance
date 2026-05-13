@@ -97,6 +97,101 @@ def train(
     return history
 
 
+def train_gnn(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    adj_norm: torch.Tensor,
+    epochs: int       = 100,
+    lr: float         = 1e-3,
+    patience: int     = 10,
+    device: str       = "cpu",
+    day_weight: float = 2.0,
+) -> dict:
+    """Train the GNN model whose batches are (x, y, is_day) + a fixed adj_norm."""
+    model = model.to(device)
+    adj_norm = adj_norm.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5
+    )
+
+    best_val   = float("inf")
+    best_state = None
+    no_improve = 0
+    history    = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_losses = []
+        for x, y, is_day in train_loader:
+            x, y, is_day = x.to(device), y.to(device), is_day.to(device)
+            optimizer.zero_grad()
+            loss = masked_mse_loss(model(x, adj_norm), y, is_day, day_weight)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for x, y, is_day in val_loader:
+                x, y, is_day = x.to(device), y.to(device), is_day.to(device)
+                val_losses.append(
+                    masked_mse_loss(model(x, adj_norm), y, is_day, day_weight).item()
+                )
+
+        tl, vl = float(np.mean(train_losses)), float(np.mean(val_losses))
+        history["train_loss"].append(tl)
+        history["val_loss"].append(vl)
+        scheduler.step(vl)
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"Epoch {epoch:>4} | train {tl:.5f} | val {vl:.5f}")
+
+        if vl < best_val - 1e-5:
+            best_val   = vl
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch} (best val {best_val:.5f})")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return history
+
+
+@torch.no_grad()
+def predict_gnn(
+    model: nn.Module,
+    loader: DataLoader,
+    adj_norm: torch.Tensor,
+    device: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run GNN on a DataLoader. Returns (y_true, y_pred, is_day)."""
+    model.eval()
+    model.to(device)
+    adj_norm = adj_norm.to(device)
+    all_true, all_pred, all_day = [], [], []
+
+    for x, y, is_day in loader:
+        x = x.to(device)
+        all_true.append(y.numpy())
+        all_pred.append(model(x, adj_norm).cpu().numpy())
+        all_day.append(is_day.numpy())
+
+    return (
+        np.concatenate(all_true, axis=0),
+        np.concatenate(all_pred, axis=0),
+        np.concatenate(all_day, axis=0),
+    )
+
+
 @torch.no_grad()
 def predict(
     model: nn.Module,
