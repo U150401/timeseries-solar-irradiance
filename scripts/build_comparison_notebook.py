@@ -138,20 +138,31 @@ for ax, h_idx, h in zip(axes, range(len(HORIZONS)), HORIZONS):
 fig.tight_layout(); plt.show()
 """)
 
-md("""## 5. Time series — first 7 days of the test set, 1h forecast
+md("""## 5. Time series — first 7 days of the test set, all horizons
 
 SARIMA is hourly (168 points / 7 days); GRU and GNN are 15-min (672 points / 7 days).
-The horizontal axis is the test-step index within each panel.
+The horizontal axis is the test-step index within each panel. Rows are models,
+columns are forecast horizons (1h, 6h, 24h).
 """)
 
-code("""fig, axes = plt.subplots(3, 1, figsize=(14, 9))
-for ax, (name, key) in zip(axes, [("SARIMA", "sarima"), ("SolarGRU", "gru"), ("SolarGNN", "gnn")]):
+code("""fig, axes = plt.subplots(3, len(HORIZONS), figsize=(5 * len(HORIZONS), 9), sharey=True)
+for row_idx, (name, key) in enumerate([("SARIMA", "sarima"), ("SolarGRU", "gru"), ("SolarGNN", "gnn")]):
     r = results[key]
     n = min(168 if name == "SARIMA" else 672, len(r["y_true"]))
-    ax.plot(r["y_true"][:n, 0], color="k", lw=0.8, label="Actual")
-    ax.plot(r["y_pred"][:n, 0], color=colors[name], lw=1.0, label=f"{name} pred")
-    ax.plot(r["y_pers"][:n, 0], color="grey", lw=0.6, ls="--", label="Persistence")
-    ax.set_title(f"{name} — 1h forecast, first 7 days of test"); ax.set_ylabel("kt"); ax.legend(); ax.grid(alpha=0.3)
+    for col_idx, h in enumerate(HORIZONS):
+        ax = axes[row_idx, col_idx]
+        ax.plot(r["y_true"][:n, col_idx], color="k", lw=0.8, label="Actual")
+        ax.plot(r["y_pred"][:n, col_idx], color=colors[name], lw=1.0, label=f"{name} pred")
+        ax.plot(r["y_pers"][:n, col_idx], color="grey", lw=0.6, ls="--", label="Persistence")
+        ax.set_title(f"{name} — {h}h forecast")
+        if col_idx == 0:
+            ax.set_ylabel("kt")
+        if row_idx == 2:
+            ax.set_xlabel("test-step index")
+        ax.grid(alpha=0.3)
+        if row_idx == 0 and col_idx == len(HORIZONS) - 1:
+            ax.legend(loc="upper right", fontsize=8)
+fig.suptitle("First 7 days of the test set — actual vs predicted vs persistence")
 fig.tight_layout(); plt.show()
 """)
 
