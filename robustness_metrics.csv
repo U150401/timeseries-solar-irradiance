@@ -1,0 +1,9 @@
+,Current_Skill,Current_Skill,Current_Skill,Degradation_%,Degradation_%,Degradation_%
+Horizon,1h,24h,6h,1h,24h,6h
+Scenario,,,,,,
+Drop Closest,0.191,0.649,0.504,-16.906,-0.425,-2.164
+Drop Farthest,0.138,0.634,0.477,15.504,1.916,3.311
+Full Mesh,0.163,0.646,0.493,0.0,0.0,0.0
+Target Only,0.155,0.626,0.468,4.93,3.163,5.201
+Top-1 Neighbor,0.138,0.644,0.498,15.51,0.394,-1.006
+Top-3 Neighbors,0.174,0.64,0.488,-6.409,1.025,1.154
